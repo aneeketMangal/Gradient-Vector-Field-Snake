@@ -1,225 +1,102 @@
-'''
-Created on Jun 7, 2012
 
-@author: vinnie
-'''
-
-import os
 import sys
-import cv2 as cv
-from scipy.ndimage import filters
-#import scipy.signal as signal
+import skimage.color
+import skimage.data
+import skimage.transform
+import skimage.io
+import skimage.filters as skimage_filter
 import numpy as np
-import pylab as plb
-import matplotlib.cm as cm
-from itertools import product
+import matplotlib.pyplot as plt
 
-_ALPHA = 100
-_BETA = 200
-_W_LINE = 250
-_W_EDGE = 30
-_MIN_DISTANCE = 10
-_INITIAL_SMOOTH = 15
-_INITIAL_ITERATIONS = 30
-_ITERATIONS_DELTA = 5 
-_SMOOTH_FACTOR_DELTA = 4
+def gradient_vector_flow(fx, fy, mu, dx=1.0, dy=1.0, verbose=True):
+    u'''calc gradient vector flow of input gradient field fx, fy'''
+    # calc some coefficients.
+    b = fx**2.0 + fy**2.0
+    c1, c2 = b*fx, b*fy
+    # calc dt from scaling parameter r.
+    r = 0.25 # (17) r < 1/4 required for convergence.
+    dt = dx*dy/(r*mu)
+    # max iteration
+    N = int(max(1, np.sqrt(img.shape[0]*img.shape[1])))
+    # initialize u(x, y), v(x, y) by the input.
+    curr_u = fx
+    curr_v = fy
+    def laplacian(m):
+        return np.hstack([m[:, 0:1], m[:, :-1]]) + np.hstack([m[:, 1:], m[:, -2:-1]]) \
+                + np.vstack([m[0:1, :], m[:-1, :]]) + np.vstack([m[1:, :], m[-2:-1, :]]) \
+                - 4*m
+    for i in range(N):
+        next_u = (1.0 - b*dt)*curr_u + r*laplacian(curr_u) + c1*dt
+        next_v = (1.0 - b*dt)*curr_v + r*laplacian(curr_v) + c2*dt
+        curr_u, curr_v = next_u, next_v
+        if verbose:
+            sys.stdout.write('.')
+            sys.stdout.flush()
+    if verbose:
+        sys.stdout.write('\n')
+    return curr_u, curr_v
 
-_NUM_NEIGHBORS = 9
-_MAX_SNAXELS = 10000
-_INITIAL_DISTANCE_BETWEEN_SNAXELS = 50
+def edge_map(img, sigma):
+    blur = skimage_filter.gaussian(img, sigma)
+    return skimage_filter.sobel(blur)
 
-def _display(image, snaxels=None):
-    """
-    Display a grayscale image with pylab, and draw the contour if there is any.
-    """
-    plb.clf()
-    if snaxels is not None:
-        for s in snaxels:
-            plb.plot(s[0],s[1],'g.',markersize=10.0)
-    
-    plb.imshow(image, cmap=cm.Greys_r)
-    plb.draw()
-    
-    return
+def gradient_field(im):
+    im = skimage_filter.gaussian(im, 1.0)
+    gradx = np.hstack([im[:, 1:], im[:, -2:-1]]) - np.hstack([im[:, 0:1], im[:, :-1]]) 
+    grady = np.vstack([im[1:, :], im[-2:-1, :]]) - np.vstack([im[0:1, :], im[:-1, :]]) 
+    return gradx, grady
 
-def _gradientImage(image):
-    """
-    Obtain a gradient image (in both x and y directions)
-    """
-    gradient = np.sqrt(filters.sobel(image, 0)**2 + filters.sobel(image, 1)**2)
-    gradient -= gradient.min()
+def add_border(img, width):
+    h, w = img.shape
+    val = img[:, 0].mean() + img[:, -1].mean() + img[0, :].mean() + img[-1, :].mean()
+    res = np.zeros((h + width*2, w + width*2), dtype=img.dtype) + val
+    res[width:h+width, width:w+width] = img
+    res[:width, :] = res[width, :][np.newaxis, :]
+    res[:, :width] = res[:, width][:, np.newaxis]
+    res[h+width:, :] = res[h+width-1, :][np.newaxis, :]
+    res[:, w+width:] = res[:, w+width-1][:, np.newaxis]
+    return res
 
-    return gradient 
-  
-def _inBounds(image, point):
-    """
-    Is the point within the bounds of the image?
-    """
-    return np.all(point < np.shape(image)) and np.all(point > 0)
-
-def _externalEnergy(image, smooth_image, point):
-    """
-    The external energy of the point, a combination of line and edge 
-    """
-    pixel = 255 * image[point[1]][point[0]]
-    smooth_pixel = 255 * smooth_image[point[1]][point[0]]
-    external_energy = (_W_LINE * pixel) - (_W_EDGE * (smooth_pixel**2))
-    return external_energy
-
-def _energy(image, smooth_image, current_point, next_point, previous_point=None):
-    """
-    Total energy (internal and external).
-    Internal energy measures the shape of the contour
-    """
-    d_squared = np.linalg.norm(next_point -current_point)**2
-    
-    if previous_point is None:
-        e =  _ALPHA * d_squared + _externalEnergy(image, smooth_image, current_point)
-        return e 
+if __name__=='__main__':
+    # load image and preprocess
+    if len(sys.argv) > 1:
+        fn = sys.argv[1]
+        img = skimage.color.rgb2gray(skimage.io.imread(fn))
     else:
-        deriv = np.sum((next_point - 2 * current_point + previous_point)**2)
-        e = 0.5 * (_ALPHA * d_squared + _BETA * deriv + _externalEnergy(image, smooth_image, current_point))
-        return e
+        img = skimage.color.rgb2gray(skimage.data.lena())
+        img = skimage.transform.resize(img, (256, 256))
+    img = img.astype(np.float32) / 255.0
+    img = add_border(img, 32)
+    edge = edge_map(img, sigma=2)
 
-def _iterateContour(image, smooth_image, snaxels, energy_matrix, position_matrix, neighbors):
-    """
-    Compute the minimum energy locations for all the snaxels in the contour
-    """
-    snaxels_added = len(snaxels)
-    for curr_idx in range(snaxels_added - 1, 0, -1):
-        energy_matrix[curr_idx][:][:] = float("inf")
-        prev_idx = (curr_idx - 1) % snaxels_added
-        next_idx = (curr_idx + 1) % snaxels_added
-        
-        for j, next_neighbor in enumerate(neighbors):
-            next_node = snaxels[next_idx] + next_neighbor
-            
-            if not _inBounds(image, next_node):
-                continue
-            
-            min_energy = float("inf")
-            for k, curr_neighbor in enumerate(neighbors):
-                curr_node = snaxels[curr_idx] + curr_neighbor
-                distance = np.linalg.norm(next_node - curr_node)
-                
-                if not _inBounds(image, curr_node) or (distance < _MIN_DISTANCE):
-                    continue
-                
-                min_energy = float("inf")
-                for l, prev_neighbor in enumerate(neighbors):
-                    prev_node = snaxels[prev_idx] + prev_neighbor
-                        
-                    if not _inBounds(image, prev_node):
-                        continue
-                        
-                    energy = energy_matrix[prev_idx][k][l] + _energy(image, smooth_image, curr_node, next_node, prev_node)
-                    
-                    if energy < min_energy:
-                        min_energy = energy
-                        min_position_k = k
-                        min_position_l = l
-                
-                energy_matrix[curr_idx][j][k] = min_energy
-                position_matrix[curr_idx][j][k][0] = min_position_k
-                position_matrix[curr_idx][j][k][1] = min_position_l
-    
-    min_final_energy = float("inf")
-    min_final_position_j = 0
-    min_final_position_k = 0
+    # calc GVF
+    fx, fy = gradient_field(edge)
+    gx, gy = gradient_vector_flow(fx, fy, mu=1.0)
 
-    for j in range(_NUM_NEIGHBORS):
-        for k in range(_NUM_NEIGHBORS):
-            if energy_matrix[snaxels_added - 2][j][k] < min_final_energy:
-                min_final_energy = energy_matrix[snaxels_added - 2][j][k]
-                min_final_position_j = j
-                min_final_position_k = k
-
-    pos_j = min_final_position_j
-    pos_k = min_final_position_k
-    
-    for i in range(snaxels_added - 1, -1, -1):
-        snaxels[i] = snaxels[i] + neighbors[pos_j]
-        if i > 0:
-            pos_j = position_matrix[i - 1][pos_j][pos_k][0]
-            pos_k = position_matrix[i - 1][pos_j][pos_k][1]
-            
-    return min_final_energy
-
-def activeContour(image, snaxels):
-    """
-    Iterate the contour until the energy reaches an equilibrium
-    """
-    energy_matrix = np.zeros( (_MAX_SNAXELS - 1, _NUM_NEIGHBORS, _NUM_NEIGHBORS), dtype=np.float32)
-    position_matrix = np.zeros( (_MAX_SNAXELS - 1, _NUM_NEIGHBORS, _NUM_NEIGHBORS, 2), dtype=np.int32 )
-    neighbors = np.array([[i, j] for i in range(-1, 2) for j in range(-1, 2)])
-    min_final_energy_prev = float("inf")
-    
-    counter = 0
-    smooth_factor = _INITIAL_SMOOTH 
-    iterations = _INITIAL_ITERATIONS
-    gradient_image = _gradientImage(image)
-    smooth_image = cv.blur(gradient_image, (smooth_factor, smooth_factor))
-        
-    while True:
-        counter += 1
-        if not (counter % iterations):
-            iterations += _ITERATIONS_DELTA
-            if smooth_factor > _SMOOTH_FACTOR_DELTA:
-                smooth_factor -= _SMOOTH_FACTOR_DELTA            
-            smooth_image = cv.blur(gradient_image, (smooth_factor, smooth_factor))
-            print ("Deblur step, smooth factor now: ", smooth_factor)
-        
-        _display(smooth_image, snaxels)
-        min_final_energy = _iterateContour(image, smooth_image, snaxels, energy_matrix, position_matrix, neighbors)
-        
-        if (min_final_energy == min_final_energy_prev) or smooth_factor < _SMOOTH_FACTOR_DELTA:
-            print ("Min energy reached at ", min_final_energy)
-            print ("Final smooth factor ", smooth_factor)
-            break
-        else:
-            min_final_energy_prev = min_final_energy
-        
-
-def _pointsOnCircle(center, radius, num_points=12):
-    points = np.zeros((num_points, 2), dtype=np.int32)
-    for i in range(num_points):
-        theta = float(i)/num_points * (2 * np.pi)
-        x = center[0] + radius * np.cos(theta)
-        y = center[1] + radius * np.sin(theta)
-        p = [x, y]
-        points[i] = p
-        
-    return points
-
-def activeContourFromCircle(image_file, center, radius):
-    image = plb.imread(image_file)
-    if image.ndim > 2:
-        image = np.mean(image, axis=2)
-    print ("Image size: ", image.shape)
-    
-    plb.ion()
-    plb.figure(figsize=np.array(np.shape(image))/50.)
-    
-    _display(image)
-#    num_points = int((2 * np.pi * radius)/_INITIAL_DISTANCE_BETWEEN_SNAXELS)
-    snaxels = _pointsOnCircle(center, radius, 30)
-    _display(image, snaxels)
-    activeContour(image, snaxels)
-    
-    # show and save the result
-    plb.ioff()
-    _display(image, snaxels)
-    plb.savefig(os.path.splitext(image_file)[0] + "-contour-result.png")
-    plb.show()
-    return
-
-def _test():
-    """
-    Run the active contour on an image file
-    """
-    activeContourFromCircle("mri.png", (290, 440), 125)
-    
-    return
-
-if __name__ == '__main__':
-    _test()
+    # plot the results
+    H, W = img.shape
+    Y, X = np.meshgrid(range(0, H, 5), range(0, W, 5))
+    def plot_vector_field(ax, vx, vy):
+        scale = np.sqrt(np.max(vx**2+vy**2))*20.0
+        ax.imshow(img, cmap='gray')
+        # vy shold be inversed (top=+Y -> top=-Y)
+        ax.quiver(X, Y, vx[Y, X], -vy[Y, X], scale=scale, color='blue', headwidth=5)
+    def vmin(values): return -max(values.max(), -values.min())
+    def vmax(values): return max(values.max(), -values.min())
+    fig, axs = plt.subplots(2, 4, figsize=(16, 8))
+    fig.suptitle('Gradient Vector Flow (2D) demo')
+    ax = axs[0][0]; ax.imshow(img, cmap='gray'); ax.set_title('org')
+    ax = axs[0][1]; ax.imshow(edge[:, :], cmap='gray'); ax.set_title('edge')
+    ax = axs[0][2]; ax.imshow(fx, vmin=vmin(fx), vmax=vmax(fx), cmap='seismic'); ax.set_title('fx')
+    ax = axs[0][3]; ax.imshow(fy, vmin=vmin(fx), vmax=vmax(fx), cmap='seismic'); ax.set_title('fy')
+    ax = axs[1][0]; ax.imshow(gx, vmin=vmin(gx), vmax=vmax(gx), cmap='seismic'); ax.set_title('GVFx')
+    ax = axs[1][1]; ax.imshow(gy, vmin=vmin(gy), vmax=vmax(gy), cmap='seismic'); ax.set_title('GVFy')
+    ax = axs[1][2]; plot_vector_field(ax, fx, fy); ax.set_title('f')
+    ax = axs[1][3]; plot_vector_field(ax, gx, gy); ax.set_title('GVF')
+    fig.tight_layout()
+    fig, axs = plt.subplots(1, 2, figsize=(12, 8))
+    fig.suptitle('Gradient Vector Flow (2D) demo')
+    ax = axs[0]; plot_vector_field(ax, fx, fy); ax.set_title('f')
+    ax = axs[1]; plot_vector_field(ax, gx, gy); ax.set_title('GVF')
+    fig.tight_layout()
+    plt.show()
