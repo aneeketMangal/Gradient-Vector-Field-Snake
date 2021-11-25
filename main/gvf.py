@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import tkinter
 from tkinter import *
 from PIL import Image, ImageTk
+from gui import *
 
 def gradient_vector_flow(fx, fy, mu, dx=1.0, dy=1.0, verbose=True):
     u'''calc gradient vector flow of input gradient field fx, fy'''
@@ -73,14 +74,8 @@ if __name__=='__main__':
 
     img = img.astype(np.float32) / 255.0 #normalising the pixel values
     img = add_border(img, 32)
-    root = Tk()
-    test = ImageTk.PhotoImage(img)
-    label1 = tkinter.Label(image=test)
-    label1.image = test
-    label1.place(x=0, y= 0)
-    root.mainloop()
-
-
+    img.save("temp.png")
+    # plt.imshow(img, cmap = "gray")
 
     # edge = edge_map(img, sigma=2)
 
